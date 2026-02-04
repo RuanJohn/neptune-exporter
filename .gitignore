@@ -17,3 +17,8 @@ wheels/
 .neptune/
 wandb/
 exports/
+
+./log
+*-logs/
+uploads/
+*.log

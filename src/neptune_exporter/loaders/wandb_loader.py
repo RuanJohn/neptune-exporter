@@ -35,6 +35,7 @@ class WandBLoader(DataLoader):
         self,
         entity: str,
         api_key: Optional[str] = None,
+        project: Optional[str] = None,
         name_prefix: Optional[str] = None,
         show_client_logs: bool = False,
     ):
@@ -44,10 +45,12 @@ class WandBLoader(DataLoader):
         Args:
             entity: W&B entity (organization/username)
             api_key: Optional W&B API key for authentication
+            project: Optional W&B project name. If not specified, derives from Neptune project ID.
             name_prefix: Optional prefix for project and run names
             verbose: Enable verbose logging
         """
         self.entity = entity
+        self.project = project
         self.name_prefix = name_prefix
         self._logger = logging.getLogger(__name__)
         self._active_run: Optional[wandb.Run] = None
@@ -83,7 +86,11 @@ class WandBLoader(DataLoader):
         return sanitized
 
     def _get_project_name(self, project_id: str) -> str:
-        """Get W&B project name from Neptune project ID."""
+        """Get W&B project name from Neptune project ID or use custom project name."""
+        # If a custom project name is specified, use it directly
+        if self.project:
+            return self.project
+
         # W&B uses entity/project structure
         # Neptune project_id maps directly to W&B project
         name = project_id

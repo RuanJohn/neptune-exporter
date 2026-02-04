@@ -393,6 +393,10 @@ def export(
     help="W&B API key for authentication. Only used with --loader wandb.",
 )
 @click.option(
+    "--wandb-project",
+    help="W&B project name. If not specified, derives from Neptune project ID. Only used with --loader wandb.",
+)
+@click.option(
     "--comet-workspace",
     help="Comet workspace. Only used with --loader comet.",
 )
@@ -455,6 +459,7 @@ def load(
     mlflow_tracking_uri: str | None,
     wandb_entity: str | None,
     wandb_api_key: str | None,
+    wandb_project: str | None,
     litlogger_owner: str | None,
     litlogger_api_key: str | None,
     litlogger_user_id: str | None,
@@ -616,6 +621,7 @@ def load(
         data_loader = WandBLoader(
             entity=wandb_entity,
             api_key=wandb_api_key,
+            project=wandb_project,
             name_prefix=name_prefix,
             show_client_logs=verbose,
         )
