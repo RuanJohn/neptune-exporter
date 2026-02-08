@@ -22,3 +22,5 @@ exports/
 *-logs/
 uploads/
 *.log
+*exports/
+.DS_Store
