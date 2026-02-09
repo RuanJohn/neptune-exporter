@@ -10,6 +10,8 @@ Usage:
 """
 
 import json
+import os
+import random
 import shutil
 import subprocess
 import time
@@ -17,18 +19,25 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+NUM_CPUS_AVAILABLE = len(os.sched_getaffinity(0))
+
 # Configuration
 WANDB_ENTITY = "ruan-marl-masters"
-WANDB_PROJECT = "centralised-marl-msc"
-DATA_PATH = Path("./exports/data")
-FILES_PATH = Path("./exports/files")
-TEMP_BASE = Path("./uploads")  # Temp directory for batch uploads
+DATA_PATH = Path(f"/scratch/{os.getenv('USER')}/exports/data")
+FILES_PATH = Path(f"/scratch/{os.getenv('USER')}/exports/files")
+TEMP_BASE = Path(f"/scratch/{os.getenv('USER')}/exports/uploads")  # Temp directory for batch uploads
 
 # Batch settings
 RUNS_PER_BATCH = 50  # How many runs to upload at a time
-NUM_WORKERS = 4  # Number of parallel processes
+NUM_WORKERS = max(1, NUM_CPUS_AVAILABLE - 1)  # At least 1 worker
 MAX_RETRIES = 3
-RETRY_DELAY = 30  # seconds
+RETRY_DELAY = 30  # Base delay in seconds (used with exponential backoff)
+# Jitter to avoid W&B API throttling when many workers start at once
+START_JITTER_SEC = (0, 15)  # (min, max) seconds one-time sleep per worker process
+END_JITTER_SEC = (0, 3)  # (min, max) seconds to sleep after batch so next batch starts spread out
+
+# Process-local flag so each worker only jitters once on first batch
+_WORKER_INIT_DONE = False
 
 # Log file
 LOG_FILE = Path(f"batch_load_wandb_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -147,6 +156,14 @@ def load_batch_worker(args: tuple) -> tuple[int, bool, list[str], str]:
     if not run_infos:
         return (batch_num, True, [], "Empty batch")
     
+    # One-time jitter per worker process to stagger initial W&B API requests
+    global _WORKER_INIT_DONE
+    if not _WORKER_INIT_DONE:
+        jitter = random.uniform(*START_JITTER_SEC)
+        log(f"[Worker] First batch - sleeping {jitter:.1f}s startup jitter", log_file)
+        time.sleep(jitter)
+        _WORKER_INIT_DONE = True
+    
     run_ids = [r[0] for r in run_infos]
     log(f"[Worker] Batch {batch_num}/{total_batches}: Uploading {len(run_infos)} runs ({run_ids[0]} to {run_ids[-1]})...", log_file)
     
@@ -195,7 +212,6 @@ def load_batch_worker(args: tuple) -> tuple[int, bool, list[str], str]:
             "uv", "run", "neptune-exporter", "load",
             "--loader", "wandb",
             "--wandb-entity", WANDB_ENTITY,
-            "--wandb-project", WANDB_PROJECT,
             "--data-path", str(temp_data),
             "--files-path", str(temp_files),
             "--no-progress",
@@ -218,12 +234,14 @@ def load_batch_worker(args: tuple) -> tuple[int, bool, list[str], str]:
                 
                 if result.returncode == 0:
                     log(f"[Worker] Batch {batch_num} completed successfully, cleaning up temp dir", log_file)
-                    # Clean up temp directory only (./uploads/batch_N/), never ./exports/
+                    # Clean up temp directory only (uploads/batch_N/), never exports/
                     try:
                         shutil.rmtree(temp_dir)
                         log(f"[Worker] Batch {batch_num} temp dir cleaned up", log_file)
                     except Exception as cleanup_err:
                         log(f"[Worker] Batch {batch_num} cleanup warning: {cleanup_err}", log_file)
+                    # Small jitter before returning so next batch start is spread out
+                    time.sleep(random.uniform(*END_JITTER_SEC))
                     return (batch_num, True, run_ids, "Success")
                 else:
                     error_msg = result.stderr[:500] if result.stderr else "No error message"
@@ -233,16 +251,20 @@ def load_batch_worker(args: tuple) -> tuple[int, bool, list[str], str]:
                             log(f"[Worker] Batch {batch_num} stderr | {line}", log_file)
                     
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_DELAY)
+                        delay = RETRY_DELAY * (2**attempt) + random.uniform(0, 5)
+                        log(f"[Worker] Batch {batch_num} retrying in {delay:.1f}s", log_file)
+                        time.sleep(delay)
                         
             except subprocess.TimeoutExpired:
                 log(f"[Worker] Batch {batch_num} timed out (attempt {attempt + 1}/{MAX_RETRIES})", log_file)
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
+                    delay = RETRY_DELAY * (2**attempt) + random.uniform(0, 5)
+                    time.sleep(delay)
             except Exception as e:
                 log(f"[Worker] Batch {batch_num} error: {e}", log_file)
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
+                    delay = RETRY_DELAY * (2**attempt) + random.uniform(0, 5)
+                    time.sleep(delay)
         
         # Clean up on failure too
         log(f"[Worker] Batch {batch_num} failed, cleaning up temp dir", log_file)
@@ -268,7 +290,6 @@ def main():
     log("=" * 60)
     log("Starting batch W&B upload (MULTIPROCESSING)")
     log(f"Entity: {WANDB_ENTITY}")
-    log(f"Project: {WANDB_PROJECT}")
     log(f"Runs per batch: {RUNS_PER_BATCH}")
     log(f"Parallel workers: {NUM_WORKERS}")
     log(f"Log file: {LOG_FILE}")
