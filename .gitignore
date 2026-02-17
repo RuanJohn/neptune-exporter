@@ -24,3 +24,5 @@ uploads/
 *.log
 *exports/
 .DS_Store
+*.err
+*.out

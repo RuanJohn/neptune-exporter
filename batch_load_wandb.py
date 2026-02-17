@@ -28,7 +28,7 @@ FILES_PATH = Path(f"/scratch/{os.getenv('USER')}/exports/files")
 TEMP_BASE = Path(f"/scratch/{os.getenv('USER')}/exports/uploads")  # Temp directory for batch uploads
 
 # Batch settings
-RUNS_PER_BATCH = 50  # How many runs to upload at a time
+RUNS_PER_BATCH = 10  # How many runs to upload at a time
 NUM_WORKERS = max(1, NUM_CPUS_AVAILABLE - 1)  # At least 1 worker
 MAX_RETRIES = 3
 RETRY_DELAY = 30  # Base delay in seconds (used with exponential backoff)
@@ -209,7 +209,7 @@ def load_batch_worker(args: tuple) -> tuple[int, bool, list[str], str]:
         
         # Run neptune-exporter load on temp directory
         cmd = [
-            "uv", "run", "neptune-exporter", "load",
+            "neptune-exporter", "load",
             "--loader", "wandb",
             "--wandb-entity", WANDB_ENTITY,
             "--data-path", str(temp_data),
