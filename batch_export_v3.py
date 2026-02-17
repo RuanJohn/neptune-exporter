@@ -2,13 +2,18 @@
 """
 Multiprocessing batch export script for large Neptune projects.
 
-Uses 6 parallel processes to speed up exports significantly.
+Uses parallel processes to speed up exports significantly.
 Each process handles batches independently using NQL server-side filtering.
 
+Supports incremental mode: only fetches new runs since the last cache update,
+merges them into the existing cache, and exports only what's missing locally.
+
 Usage:
-    uv run python batch_export_v3.py
+    uv run python batch_export_v3.py                # incremental (default)
+    uv run python batch_export_v3.py --full          # full re-scan of all dates
 """
 
+import argparse
 import json
 import os
 import random
@@ -92,11 +97,129 @@ def save_run_ids_to_cache(run_ids: list[str], complete: bool = False):
 
 
 def get_all_run_ids(force_refresh: bool = False) -> list[str]:
-    """Fetch all run IDs using time-based pagination with NQL queries."""
+    """Fetch all run IDs using time-based pagination with NQL queries (full scan)."""
+    return _fetch_run_ids(
+        start_date=datetime(2024, 8, 10),
+        force_refresh=force_refresh,
+    )
+
+
+def get_new_run_ids() -> list[str]:
+    """Incrementally fetch only new run IDs since the last cache update.
+
+    Loads the existing cache, scans Neptune from the last fetch date (minus 1 day
+    overlap for safety) to today, merges new IDs, and returns the full list.
+    """
     from datetime import timedelta
 
-    START_DATE = datetime(2024, 8, 10)
-    END_DATE = datetime(2026, 1, 30)
+    cached_ids, is_complete = load_cached_run_ids()
+    fetched_at = load_cache_fetched_at()
+
+    if not cached_ids:
+        log("No cache found - falling back to full scan")
+        return get_all_run_ids()
+
+    # Start 1 day before last fetch to catch any stragglers
+    scan_from = fetched_at - timedelta(days=1)
+    log(f"Incremental mode: scanning from {scan_from.date()} to today")
+    log(f"Existing cache has {len(cached_ids)} run IDs")
+
+    new_ids = _fetch_run_ids_range(scan_from)
+
+    seen_ids = set(cached_ids)
+    added = 0
+    for rid in new_ids:
+        if rid not in seen_ids:
+            cached_ids.append(rid)
+            seen_ids.add(rid)
+            added += 1
+
+    log(f"Found {added} new run IDs (total now: {len(cached_ids)})")
+    save_run_ids_to_cache(cached_ids, complete=True)
+
+    return cached_ids
+
+
+def load_cache_fetched_at() -> datetime:
+    """Read the 'fetched_at' timestamp from the run IDs cache file."""
+    if RUN_IDS_CACHE.exists():
+        with open(RUN_IDS_CACHE) as f:
+            data = json.load(f)
+            ts = data.get("fetched_at")
+            if ts:
+                return datetime.fromisoformat(ts)
+    return datetime(2024, 8, 10)
+
+
+def _fetch_run_ids_range(start_date: datetime) -> list[str]:
+    """Fetch run IDs from Neptune for a date range (start_date to tomorrow)."""
+    from datetime import timedelta
+
+    end_date = datetime.now() + timedelta(days=1)
+
+    log(f"Fetching run IDs: {start_date.date()} to {end_date.date()}")
+
+    all_run_ids = []
+    seen_ids: set[str] = set()
+
+    project = neptune.init_project(PROJECT, mode="read-only")
+
+    try:
+        current_date = start_date
+        day_count = 0
+        total_days = (end_date - start_date).days
+
+        while current_date < end_date:
+            next_date = current_date + timedelta(days=1)
+            day_count += 1
+
+            query = (
+                f'`sys/creation_time`:datetime >= "{current_date.strftime("%Y-%m-%dT00:00:00Z")}" '
+                f'AND `sys/creation_time`:datetime < "{next_date.strftime("%Y-%m-%dT00:00:00Z")}"'
+            )
+
+            log(f"  Day {day_count}/{total_days}: {current_date.date()}...")
+
+            try:
+                runs_table = project.fetch_runs_table(
+                    query=query,
+                    columns=["sys/id"],
+                    trashed=False,
+                )
+
+                df = runs_table.to_pandas()
+
+                if not df.empty:
+                    run_ids = df["sys/id"].tolist()
+                    new_ids = [rid for rid in run_ids if rid not in seen_ids]
+                    all_run_ids.extend(new_ids)
+                    seen_ids.update(new_ids)
+
+                    if new_ids:
+                        log(
+                            f"    Found {len(run_ids)} runs ({len(new_ids)} new)"
+                        )
+
+            except Exception as e:
+                log(f"    Error on {current_date.date()}: {e}")
+
+            current_date = next_date
+            time.sleep(0.5)
+
+    finally:
+        project.stop()
+
+    log(f"Fetched {len(all_run_ids)} run IDs from date range")
+    return all_run_ids
+
+
+def _fetch_run_ids(
+    start_date: datetime, force_refresh: bool = False
+) -> list[str]:
+    """Full scan: fetch all run IDs from start_date to today."""
+    from datetime import timedelta
+
+    end_date = datetime.now() + timedelta(days=1)
 
     cached_ids = []
 
@@ -108,8 +231,8 @@ def get_all_run_ids(force_refresh: bool = False) -> list[str]:
         elif cached_ids:
             log(f"Cache has {len(cached_ids)} runs but incomplete, continuing...")
 
-    log("Fetching run IDs using time-based pagination...")
-    log(f"Date range: {START_DATE.date()} to {END_DATE.date()}")
+    log("Fetching run IDs using time-based pagination (full scan)...")
+    log(f"Date range: {start_date.date()} to {end_date.date()}")
 
     all_run_ids = list(cached_ids)
     seen_ids = set(all_run_ids)
@@ -117,11 +240,11 @@ def get_all_run_ids(force_refresh: bool = False) -> list[str]:
     project = neptune.init_project(PROJECT, mode="read-only")
 
     try:
-        current_date = START_DATE
+        current_date = start_date
         day_count = 0
-        total_days = (END_DATE - START_DATE).days
+        total_days = (end_date - start_date).days
 
-        while current_date < END_DATE:
+        while current_date < end_date:
             next_date = current_date + timedelta(days=1)
             day_count += 1
 
@@ -290,21 +413,46 @@ def export_batch_worker(args: tuple) -> tuple[int, bool, str]:
     return (batch_num, False, f"Failed after {MAX_RETRIES} attempts")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Batch export Neptune runs to parquet files."
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Full re-scan of all dates instead of incremental (default: incremental)",
+    )
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Ignore existing cache and re-fetch all run IDs from scratch",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    incremental = not args.full
+
+    mode_label = "INCREMENTAL" if incremental else "FULL SCAN"
     log("=" * 60)
-    log("Starting batch export v3 (MULTIPROCESSING)")
+    log(f"Starting batch export v3 ({mode_label})")
     log(f"Project: {PROJECT}")
+    log(f"Data path: {DATA_PATH}")
+    log(f"Files path: {FILES_PATH}")
     log(f"Runs per batch: {RUNS_PER_BATCH}")
     log(f"Parallel workers: {NUM_WORKERS}")
     log(f"Log file: {LOG_FILE}")
     log("=" * 60)
 
-    # Create output directories on scratch
     Path(DATA_PATH).mkdir(parents=True, exist_ok=True)
     Path(FILES_PATH).mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Get all run IDs
-    all_run_ids = get_all_run_ids()
+    # Step 1: Get run IDs (incremental or full)
+    if incremental:
+        all_run_ids = get_new_run_ids()
+    else:
+        all_run_ids = get_all_run_ids(force_refresh=args.force_refresh)
 
     if not all_run_ids:
         log("No runs found!")
@@ -320,6 +468,8 @@ def main():
     if not remaining:
         log("All runs already exported!")
         return
+
+    log(f"New runs to export: {', '.join(remaining[:20])}{'...' if len(remaining) > 20 else ''}")
 
     # Step 3: Create batches
     batches = [
@@ -348,13 +498,11 @@ def main():
 
     try:
         with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-            # Submit all batches
             futures = {
                 executor.submit(export_batch_worker, args): args[0]
                 for args in worker_args
             }
 
-            # Process results as they complete
             for future in as_completed(futures):
                 batch_num = futures[future]
                 try:
@@ -365,7 +513,6 @@ def main():
                         failed += 1
                         failed_batches.append(result_batch_num)
 
-                    # Progress update every 10 batches
                     completed = successful + failed
                     if completed % 10 == 0:
                         elapsed = time.time() - start_time
